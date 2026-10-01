@@ -1851,6 +1851,8 @@ void RunCommands(Gfx* Commands, int time, int step, int denom, int count) {
         // vertices written by Skin_ApplyLimbModifications are shared by every frame of a tick,
         // so they must be re-blended before each execution.
         FrameInterpolation_UpdateSkinnedVertices(interpolationStep);
+        // Same for the ribbon trail vertices written by EffectBlure.
+        FrameInterpolation_UpdateRibbonHeads(interpolationStep);
         intp->mInterpolationT = interpolationStep;
         wnd->DrawAndRunGraphicsCommands(Commands, mtx_replacements);
         intp->mInterpolationIndex++;
