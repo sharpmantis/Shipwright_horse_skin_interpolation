@@ -2567,7 +2567,9 @@ void Environment_WarpSongLeave(PlayState* play) {
 // therefore drawn as geometry on top of it. The branch point of the display list is placed between the skybox
 // and the sun and moon, so that the stars show through the sky but are hidden wherever the moon is drawn.
 
-#define SKYBOX_STAR_NIGHT_INDEX 3  // Index of the clear night sky in sSkyboxTable
+#define SKYBOX_STAR_SUNRISE_INDEX 0 // sSkyboxTable entries, as picked by D_8011FC1C
+#define SKYBOX_STAR_SUNSET_INDEX 2
+#define SKYBOX_STAR_NIGHT_INDEX 3
 #define SKYBOX_STAR_BASE_COUNT 100 // Stars drawn before the "Star Count" multiplier is applied
 #define SKYBOX_STAR_COUNT_MULTIPLIER_MIN 1.0f
 #define SKYBOX_STAR_COUNT_MULTIPLIER_MAX 3.0f
@@ -2623,24 +2625,31 @@ static f32 sSkyboxStarAlphaScale = -1.0f;
 // Places the branch point of the star field, which must happen after the skybox is drawn and before the sun and
 // moon so that the moon still covers the stars.
 void Environment_SetupSkyboxStars(PlayState* play) {
-    u16 time = gSaveContext.dayTime;
     f32 alpha = 0.0f;
+    f32 blend = (f32)play->envCtx.skyboxBlend / 255.0f;
 
     sEnvSkyboxNumStars = 0;
     sSkyboxStarsAlpha = 0.0f;
 
-    // Stars only belong in the clear night sky, an overcast night keeps its clouds
+    // The star field follows the sky that is actually drawn, never the clock. gSaveContext.skyboxTime, which is
+    // what picks these skybox indices, is not the same thing as gSaveContext.dayTime: a frozen time scene or a
+    // cutscene snaps it to a canonical hour, so the two disagree, and a scene can be lit as day while the clock
+    // still says night. Keying on the indices of D_8011FC1C means the stars can only ever appear on the clear
+    // night sky (index 3), and the sunset and sunrise crossfades are matched exactly.
     if (CVarGetInteger(CVAR_ENHANCEMENT("MajoraStarField"), 0) && (play->skyboxId == SKYBOX_NORMAL_SKY) &&
-        !play->envCtx.skyboxDisabled &&
-        ((play->envCtx.skybox1Index == SKYBOX_STAR_NIGHT_INDEX) ||
-         (play->envCtx.skybox2Index == SKYBOX_STAR_NIGHT_INDEX))) {
-        // Same dawn and dusk windows as Majora's Mask: full at night, fading in during dusk and out before dawn
-        if ((time >= CLOCK_TIME(21, 0)) || (time < CLOCK_TIME(2, 0))) {
+        !play->envCtx.skyboxDisabled) {
+        if ((play->envCtx.skybox1Index == SKYBOX_STAR_NIGHT_INDEX) &&
+            (play->envCtx.skybox2Index == SKYBOX_STAR_NIGHT_INDEX)) {
+            // Clear night
             alpha = 1.0f;
-        } else if (time > CLOCK_TIME(19, 0)) {
-            alpha = 1.0f - ((CLOCK_TIME(21, 0) - time) * (1.0f / (CLOCK_TIME(2, 0) + 1)));
-        } else if (time < CLOCK_TIME(3, 0)) {
-            alpha = (CLOCK_TIME(3, 0) - time) * (1.0f / (CLOCK_TIME(1, 0) + 1));
+        } else if ((play->envCtx.skybox1Index == SKYBOX_STAR_SUNSET_INDEX) &&
+                   (play->envCtx.skybox2Index == SKYBOX_STAR_NIGHT_INDEX)) {
+            // Sunset crossfading into the night sky, so the stars arrive with it
+            alpha = blend;
+        } else if ((play->envCtx.skybox1Index == SKYBOX_STAR_NIGHT_INDEX) &&
+                   (play->envCtx.skybox2Index == SKYBOX_STAR_SUNRISE_INDEX)) {
+            // The night sky crossfading into sunrise, so the stars leave with it
+            alpha = 1.0f - blend;
         }
 
         sSkyboxStarsAlpha = CLAMP(alpha, 0.0f, 1.0f);
