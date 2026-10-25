@@ -31,7 +31,7 @@ uint64_t osGetTime(void);
 #define SKYBOX_STAR_NIGHT_INDEX 3
 #define SKYBOX_STAR_BASE_COUNT 100 // Stars drawn before the "Star Count" multiplier is applied
 #define SKYBOX_STAR_COUNT_MULTIPLIER_MIN 1.0f
-#define SKYBOX_STAR_COUNT_MULTIPLIER_MAX 3.0f
+#define SKYBOX_STAR_COUNT_MULTIPLIER_MAX 5.0f
 // Free bytes the polyOpa buffer must keep before extra stars stop being added
 #define SKYBOX_STAR_MIN_FREE_BYTES 8192
 
@@ -52,6 +52,17 @@ uint64_t osGetTime(void);
 #define SKYBOX_STAR_ARM_ALPHA_V 110.0f
 #define SKYBOX_STAR_ARM_MID_ALPHA 0.45f // ring alpha, relative to the base
 #define SKYBOX_STAR_VTX_SCALE 1000.0f   // Vtx positions are s16, hence pre-multiplied
+
+// Shape the stars added by the count multiplier use, so that a dense sky still fits in the display list budget.
+// It keeps the silhouette of the telescope star with far fewer vertices: a centre and eight rim vertices that
+// alternate between the four spikes and the four inner corners, fanned from the centre.
+#define SKYBOX_STAR_SIMPLE_RIM_COUNT 8
+#define SKYBOX_STAR_SIMPLE_VTX_COUNT (1 + SKYBOX_STAR_SIMPLE_RIM_COUNT)
+#define SKYBOX_STAR_SIMPLE_CENTER_ALPHA 235.0f
+#define SKYBOX_STAR_SIMPLE_CORNER_RADIUS 0.20f
+#define SKYBOX_STAR_SIMPLE_CORNER_ALPHA 150.0f
+#define SKYBOX_STAR_SIMPLE_TIP_RADIUS 0.52f
+
 // Intensity setting the shape alphas above are tuned for
 #define SKYBOX_STAR_REFERENCE_INTENSITY 0.5f
 // Twinkle rate in Hz: each star gets its own frequency between MIN_RATIO * slider and the slider value
@@ -80,6 +91,9 @@ static Vtx sSkyboxStarVtx[SKYBOX_STAR_VTX_COUNT];
 static bool sSkyboxStarVtxBuilt = false;
 // Alpha scale the vertices were last built with, -1 forces the first build
 static f32 sSkyboxStarAlphaScale = -1.0f;
+static Vtx sSkyboxSimpleStarVtx[SKYBOX_STAR_SIMPLE_VTX_COUNT];
+static bool sSkyboxSimpleStarVtxBuilt = false;
+static f32 sSkyboxSimpleStarAlphaScale = -1.0f;
 
 // Places the branch point of the star field, which must happen after the skybox is drawn and before the sun and
 // moon so that the moon still covers the stars.
@@ -270,6 +284,40 @@ static void Ship_EnsureSkyboxStarGeometry(f32 alphaScale) {
     }
 }
 
+// Cheaper shape with the same silhouette: a fan from the centre to four spike tips and four inner corners
+static void Ship_BuildSimpleSkyboxStarGeometry(f32 alphaScale) {
+    const s32 angleStep = 0x10000 / SKYBOX_STAR_SIMPLE_RIM_COUNT;
+    s32 i;
+
+    Ship_SetSkyboxStarVtx(&sSkyboxSimpleStarVtx[0], 0.0f, 0.0f,
+                          Ship_SkyboxStarAlpha(SKYBOX_STAR_SIMPLE_CENTER_ALPHA, alphaScale));
+
+    for (i = 0; i < SKYBOX_STAR_SIMPLE_RIM_COUNT; i++) {
+        s16 angle = (s16)(angleStep * i);
+        f32 cosA = Math_CosS(angle);
+        f32 sinA = Math_SinS(angle);
+
+        // Every other rim vertex is a spike tip, the ones between are the inner corners
+        if ((i & 1) == 0) {
+            Ship_SetSkyboxStarVtx(&sSkyboxSimpleStarVtx[1 + i], cosA * SKYBOX_STAR_SIMPLE_TIP_RADIUS,
+                                  sinA * SKYBOX_STAR_SIMPLE_TIP_RADIUS, 0);
+        } else {
+            Ship_SetSkyboxStarVtx(&sSkyboxSimpleStarVtx[1 + i], cosA * SKYBOX_STAR_SIMPLE_CORNER_RADIUS,
+                                  sinA * SKYBOX_STAR_SIMPLE_CORNER_RADIUS,
+                                  Ship_SkyboxStarAlpha(SKYBOX_STAR_SIMPLE_CORNER_ALPHA, alphaScale));
+        }
+    }
+
+    sSkyboxSimpleStarAlphaScale = alphaScale;
+    sSkyboxSimpleStarVtxBuilt = true;
+}
+
+static void Ship_EnsureSimpleSkyboxStarGeometry(f32 alphaScale) {
+    if (!sSkyboxSimpleStarVtxBuilt || (sSkyboxSimpleStarAlphaScale != alphaScale)) {
+        Ship_BuildSimpleSkyboxStarGeometry(alphaScale);
+    }
+}
+
 static void Ship_SetupSkyboxStarGfx(Gfx** gfxP) {
     Gfx* gfx = *gfxP;
 
@@ -317,7 +365,7 @@ static f32 Ship_SkyboxStarTwinkle(u32 seed, s32 starNum, f32 time, f32 maxFreque
 }
 
 static void Ship_DrawSkyboxStarTelescope(Gfx** gfxP, PlayState* play, Vec3f pos, u32 size, s32 starNum,
-                                         f32 sizeMultiplier, f32 alphaScale) {
+                                         f32 sizeMultiplier, f32 alphaScale, bool simple) {
     Gfx* gfx = *gfxP;
     f32 eyeDist;
     f32 distRatio;
@@ -368,36 +416,49 @@ static void Ship_DrawSkyboxStarTelescope(Gfx** gfxP, PlayState* play, Vec3f pos,
 
         gSPMatrix(gfx++, MATRIX_NEWMTX(play->state.gfxCtx), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
 
-        // Too many vertices for one G_VTX command, so load them in two batches
-        gSPVertex(gfx++, (uintptr_t)sSkyboxStarVtx, SKYBOX_STAR_CORE_VTX_COUNT, 0);
-        gSPVertex(gfx++, (uintptr_t)(sSkyboxStarVtx + SKYBOX_STAR_CORE_VTX_COUNT),
-                  SKYBOX_STAR_VTX_COUNT - SKYBOX_STAR_CORE_VTX_COUNT, SKYBOX_STAR_CORE_VTX_COUNT);
+        if (simple) {
+            Ship_EnsureSimpleSkyboxStarGeometry(alphaScale);
+            gSPVertex(gfx++, (uintptr_t)sSkyboxSimpleStarVtx, SKYBOX_STAR_SIMPLE_VTX_COUNT, 0);
 
-        // Core fan
-        for (i = 0; i < SKYBOX_STAR_CORE_SEGMENTS; i += 2) {
-            s32 next = (i + 1) % SKYBOX_STAR_CORE_SEGMENTS;
-            s32 nextNext = (i + 2) % SKYBOX_STAR_CORE_SEGMENTS;
+            // Fan from the centre to each pair of rim vertices
+            for (i = 0; i < SKYBOX_STAR_SIMPLE_RIM_COUNT; i += 2) {
+                s32 next = 1 + ((i + 1) % SKYBOX_STAR_SIMPLE_RIM_COUNT);
+                s32 nextNext = 1 + ((i + 2) % SKYBOX_STAR_SIMPLE_RIM_COUNT);
 
-            gSP2Triangles(gfx++, SKYBOX_STAR_CENTER_VTX, SKYBOX_STAR_CORE_INNER_VTX(i),
-                          SKYBOX_STAR_CORE_INNER_VTX(next), 0, SKYBOX_STAR_CENTER_VTX, SKYBOX_STAR_CORE_INNER_VTX(next),
-                          SKYBOX_STAR_CORE_INNER_VTX(nextNext), 0);
-        }
+                gSP2Triangles(gfx++, 0, 1 + i, next, 0, 0, next, nextNext, 0);
+            }
+        } else {
+            // Too many vertices for one G_VTX command, so load them in two batches
+            gSPVertex(gfx++, (uintptr_t)sSkyboxStarVtx, SKYBOX_STAR_CORE_VTX_COUNT, 0);
+            gSPVertex(gfx++, (uintptr_t)(sSkyboxStarVtx + SKYBOX_STAR_CORE_VTX_COUNT),
+                      SKYBOX_STAR_VTX_COUNT - SKYBOX_STAR_CORE_VTX_COUNT, SKYBOX_STAR_CORE_VTX_COUNT);
 
-        // Core outer band, which softens the glow edge
-        for (i = 0; i < SKYBOX_STAR_CORE_SEGMENTS; i++) {
-            s32 next = (i + 1) % SKYBOX_STAR_CORE_SEGMENTS;
+            // Core fan
+            for (i = 0; i < SKYBOX_STAR_CORE_SEGMENTS; i += 2) {
+                s32 next = (i + 1) % SKYBOX_STAR_CORE_SEGMENTS;
+                s32 nextNext = (i + 2) % SKYBOX_STAR_CORE_SEGMENTS;
 
-            gSP2Triangles(gfx++, SKYBOX_STAR_CORE_INNER_VTX(i), SKYBOX_STAR_CORE_OUTER_VTX(i),
-                          SKYBOX_STAR_CORE_OUTER_VTX(next), 0, SKYBOX_STAR_CORE_INNER_VTX(i),
-                          SKYBOX_STAR_CORE_OUTER_VTX(next), SKYBOX_STAR_CORE_INNER_VTX(next), 0);
-        }
+                gSP2Triangles(gfx++, SKYBOX_STAR_CENTER_VTX, SKYBOX_STAR_CORE_INNER_VTX(i),
+                              SKYBOX_STAR_CORE_INNER_VTX(next), 0, SKYBOX_STAR_CENTER_VTX,
+                              SKYBOX_STAR_CORE_INNER_VTX(next), SKYBOX_STAR_CORE_INNER_VTX(nextNext), 0);
+            }
 
-        // Spikes, base band then tip band
-        for (i = 0; i < 4; i++) {
-            gSP2Triangles(gfx++, SKYBOX_STAR_ARM_VTX(i, 0), SKYBOX_STAR_ARM_VTX(i, 1), SKYBOX_STAR_ARM_VTX(i, 2), 0,
-                          SKYBOX_STAR_ARM_VTX(i, 0), SKYBOX_STAR_ARM_VTX(i, 2), SKYBOX_STAR_ARM_VTX(i, 3), 0);
-            gSP2Triangles(gfx++, SKYBOX_STAR_ARM_VTX(i, 3), SKYBOX_STAR_ARM_VTX(i, 2), SKYBOX_STAR_ARM_VTX(i, 4), 0,
-                          SKYBOX_STAR_ARM_VTX(i, 3), SKYBOX_STAR_ARM_VTX(i, 4), SKYBOX_STAR_ARM_VTX(i, 5), 0);
+            // Core outer band, which softens the glow edge
+            for (i = 0; i < SKYBOX_STAR_CORE_SEGMENTS; i++) {
+                s32 next = (i + 1) % SKYBOX_STAR_CORE_SEGMENTS;
+
+                gSP2Triangles(gfx++, SKYBOX_STAR_CORE_INNER_VTX(i), SKYBOX_STAR_CORE_OUTER_VTX(i),
+                              SKYBOX_STAR_CORE_OUTER_VTX(next), 0, SKYBOX_STAR_CORE_INNER_VTX(i),
+                              SKYBOX_STAR_CORE_OUTER_VTX(next), SKYBOX_STAR_CORE_INNER_VTX(next), 0);
+            }
+
+            // Spikes, base band then tip band
+            for (i = 0; i < 4; i++) {
+                gSP2Triangles(gfx++, SKYBOX_STAR_ARM_VTX(i, 0), SKYBOX_STAR_ARM_VTX(i, 1), SKYBOX_STAR_ARM_VTX(i, 2), 0,
+                              SKYBOX_STAR_ARM_VTX(i, 0), SKYBOX_STAR_ARM_VTX(i, 2), SKYBOX_STAR_ARM_VTX(i, 3), 0);
+                gSP2Triangles(gfx++, SKYBOX_STAR_ARM_VTX(i, 3), SKYBOX_STAR_ARM_VTX(i, 2), SKYBOX_STAR_ARM_VTX(i, 4), 0,
+                              SKYBOX_STAR_ARM_VTX(i, 3), SKYBOX_STAR_ARM_VTX(i, 4), SKYBOX_STAR_ARM_VTX(i, 5), 0);
+            }
         }
 
         Matrix_Pop();
@@ -558,7 +619,10 @@ static void DrawSkyboxStarsImpl(PlayState* play, Gfx** gfxP) {
         // SoH [Enhancement] Both star shapes go through a recorded matrix, so that the frame interpolation can
         // smooth them. A screen space texture rectangle would stay pinned to the logical frame.
         if (telescopeStars) {
-            Ship_DrawSkyboxStarTelescope(&gfx, play, pos, imgWidth, i, telescopeStarSize, telescopeStarAlphaScale);
+            // The stars the count multiplier adds use the cheap shape, so that a dense sky still fits in the
+            // display list budget. The ones the scene asks for keep the detailed telescope shape.
+            Ship_DrawSkyboxStarTelescope(&gfx, play, pos, imgWidth, i, telescopeStarSize, telescopeStarAlphaScale,
+                                         i >= sEnvSkyboxNumStars);
         } else {
             Ship_DrawSkyboxStarInterpolated(&gfx, play, pos, imgWidth, 4, i);
         }

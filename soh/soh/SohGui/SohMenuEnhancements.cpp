@@ -906,7 +906,7 @@ void SohMenu::AddMenuEnhancements() {
         .CVar(CVAR_ENHANCEMENT("MajoraStarCount"))
         .RaceDisable(false)
         .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger(CVAR_ENHANCEMENT("MajoraStarField"), 0); })
-        .Options(FloatSliderOptions().Min(1.0f).Max(3.0f).DefaultValue(1.0f).Step(0.1f).Format("%.1fx").Tooltip(
+        .Options(FloatSliderOptions().Min(1.0f).Max(5.0f).DefaultValue(1.0f).Step(0.1f).Format("%.1fx").Tooltip(
             "Multiplies how many stars are generated. Extra stars extend the same seed, so the "
             "existing ones do not move."));
     AddWidget(path, "Draw Distance", WIDGET_SEPARATOR_TEXT).RaceDisable(false);
