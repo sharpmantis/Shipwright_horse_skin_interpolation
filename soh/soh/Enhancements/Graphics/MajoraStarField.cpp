@@ -64,6 +64,8 @@ static constexpr f32 SKYBOX_STAR_TWINKLE_MAX_FREQUENCY = 2.0f;
 static constexpr f32 SKYBOX_STAR_TWINKLE_MIN_RATIO = 0.15f;
 static constexpr f32 SKYBOX_STAR_TWINKLE_DEPTH = 0.5f;            // 0.5 dips to half brightness, 1.0 to invisible
 static constexpr f32 SKYBOX_STAR_CYCLES_PER_SECOND = 46875000.0f; // osGetTime() counts N64 cycles
+static constexpr f32 SKYBOX_STAR_FADE_SECONDS = 2.0f;
+static constexpr f32 SKYBOX_STAR_FADE_MAX_STEP = 0.25f; // a long stall must not swallow the whole fade
 
 static constexpr s32 SKYBOX_STAR_CENTER_VTX = 0;
 static constexpr s32 SKYBOX_STAR_CORE_VTX_COUNT = 1 + (2 * SKYBOX_STAR_CORE_SEGMENTS);
@@ -76,6 +78,13 @@ static constexpr s32 SKYBOX_STAR_VTX_COUNT = SKYBOX_STAR_CORE_VTX_COUNT + (4 * 6
 static u16 sEnvSkyboxNumStars = 0;
 // Dawn and dusk fade of the whole field
 static f32 sSkyboxStarsAlpha = 0.0f;
+// Star fade, 0 hides the field and 1 shows it at the sky brightness below
+static f32 sSkyboxStarFade = 0.0f;
+// Brightness of the last starry sky, kept so a sky turning cloudy or stormy can fade the field out
+static f32 sSkyboxStarSkyAlpha = 0.0f;
+// Scene the fade runs in, so a scene change snaps instead of fading
+static s32 sSkyboxStarScene = -1;
+static u64 sSkyboxStarFadeTime = 0;
 // Branch point of the field in polyOpa, NULL when no stars are drawn this frame
 static Gfx* sSkyboxStarsDList = NULL;
 static Vtx sSkyboxStarVtx[SKYBOX_STAR_VTX_COUNT];
@@ -88,11 +97,14 @@ static f32 sSkyboxSimpleStarAlphaScale = -1.0f;
 
 // The branch point must land after the skybox and before the sun and moon, so the moon still covers the stars.
 static void MajoraStarField_Setup(PlayState* play) {
-    f32 alpha = 0.0f;
+    const u64 now = osGetTime();
+    const f32 elapsed =
+        (sSkyboxStarFadeTime != 0) ? (f32)(now - sSkyboxStarFadeTime) / SKYBOX_STAR_CYCLES_PER_SECOND : 0.0f;
     f32 blend = (f32)play->envCtx.skyboxBlend / 255.0f;
+    f32 alpha = 0.0f;
+    bool starry = false;
 
-    sEnvSkyboxNumStars = 0;
-    sSkyboxStarsAlpha = 0.0f;
+    sSkyboxStarFadeTime = now;
 
     // Follows the drawn sky, not the clock: skyboxTime, which picks these indices, is snapped to a canonical hour
     // in frozen time scenes and cutscenes, so it can disagree with dayTime.
@@ -101,22 +113,50 @@ static void MajoraStarField_Setup(PlayState* play) {
             (play->envCtx.skybox2Index == SKYBOX_STAR_NIGHT_INDEX)) {
             // Clear night
             alpha = 1.0f;
+            starry = true;
         } else if ((play->envCtx.skybox1Index == SKYBOX_STAR_SUNSET_INDEX) &&
                    (play->envCtx.skybox2Index == SKYBOX_STAR_NIGHT_INDEX)) {
             // Sunset blending into the night sky
             alpha = blend;
+            starry = true;
         } else if ((play->envCtx.skybox1Index == SKYBOX_STAR_NIGHT_INDEX) &&
                    (play->envCtx.skybox2Index == SKYBOX_STAR_SUNRISE_INDEX)) {
             // Night sky blending into sunrise
             alpha = 1.0f - blend;
-        }
-
-        sSkyboxStarsAlpha = CLAMP(alpha, 0.0f, 1.0f);
-
-        if (sSkyboxStarsAlpha > 0.0f) {
-            sEnvSkyboxNumStars = SKYBOX_STAR_BASE_COUNT;
+            starry = true;
         }
     }
+
+    if (play->sceneNum != sSkyboxStarScene) {
+        // A scene change shows the field as the new sky is, it never fades across the transition
+        sSkyboxStarScene = play->sceneNum;
+        sSkyboxStarFade = starry ? 1.0f : 0.0f;
+    } else {
+        const f32 target = starry ? 1.0f : 0.0f;
+        // A long stall should not swallow the whole fade at once
+        const f32 step = CLAMP(elapsed, 0.0f, SKYBOX_STAR_FADE_MAX_STEP) / SKYBOX_STAR_FADE_SECONDS;
+
+        if (sSkyboxStarFade < target) {
+            sSkyboxStarFade += step;
+            if (sSkyboxStarFade > target) {
+                sSkyboxStarFade = target;
+            }
+        } else if (sSkyboxStarFade > target) {
+            sSkyboxStarFade -= step;
+            if (sSkyboxStarFade < target) {
+                sSkyboxStarFade = target;
+            }
+        }
+    }
+
+    // The sky brightness is only meaningful while the sky is a starry one, but the fade keeps using the last value
+    // so that a sky turning cloudy or stormy fades the field out instead of cutting it
+    if (starry) {
+        sSkyboxStarSkyAlpha = CLAMP(alpha, 0.0f, 1.0f);
+    }
+
+    sSkyboxStarsAlpha = sSkyboxStarSkyAlpha * sSkyboxStarFade;
+    sEnvSkyboxNumStars = (sSkyboxStarFade > 0.0f) ? SKYBOX_STAR_BASE_COUNT : 0;
 
     if (sEnvSkyboxNumStars != 0) {
         OPEN_DISPS(play->state.gfxCtx);
@@ -637,6 +677,7 @@ static void RegisterMajoraStarField() {
     COND_HOOK(OnPlayDrawViewFinal, CVarGetInteger(CVAR_STAR_FIELD, 0), []() { MajoraStarField_Draw(gPlayState); });
 
     sSkyboxStarsDList = NULL;
+    sSkyboxStarScene = -1;
 }
 
 static RegisterShipInitFunc initFunc(RegisterMajoraStarField, { CVAR_STAR_FIELD });
