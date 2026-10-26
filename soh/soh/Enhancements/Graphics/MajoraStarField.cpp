@@ -1,6 +1,9 @@
 #include <libultraship/bridge/consolevariablebridge.h>
 
 #include "soh/cvar_prefixes.h"
+#include "soh/Enhancements/game-interactor/GameInteractor.h"
+#include "soh/frame_interpolation.h"
+#include "soh/ShipInit.hpp"
 
 extern "C" {
 #include "z64.h"
@@ -8,96 +11,83 @@ extern "C" {
 #include "variables.h"
 #include "functions.h"
 
+extern PlayState* gPlayState;
 uint64_t osGetTime(void);
 }
 
 // SoH [Enhancement] Majora's Mask style star field, ported from the 2S2H "some_love_for_stars" branch.
-//
-// Ocarina of Time has no star system of its own: its night sky is a single opaque skybox texture. The stars are
-// therefore drawn as geometry on top of it. Play_Draw calls MajoraStarField_Setup between the skybox and the sun
-// and moon, then MajoraStarField_Draw once the view matrix of the frame is final, so that the stars show through
-// the sky but are hidden wherever the moon is drawn.
+// OOT has no stars of its own, so they are drawn as geometry over the skybox, between the sky and the sun and moon.
 
-#define CVAR_STAR_FIELD CVAR_ENHANCEMENT("MajoraStarField")
-#define CVAR_STAR_TELESCOPE CVAR_ENHANCEMENT("MajoraStarTelescope")
-#define CVAR_STAR_SIZE CVAR_ENHANCEMENT("MajoraStarSize")
-#define CVAR_STAR_INTENSITY CVAR_ENHANCEMENT("MajoraStarIntensity")
-#define CVAR_STAR_TWINKLE CVAR_ENHANCEMENT("MajoraStarTwinkle")
-#define CVAR_STAR_TWINKLE_FREQUENCY CVAR_ENHANCEMENT("MajoraStarTwinkleFrequency")
-#define CVAR_STAR_COUNT CVAR_ENHANCEMENT("MajoraStarCount")
+static constexpr const char* CVAR_STAR_FIELD = CVAR_ENHANCEMENT("MajoraStarField");
+static constexpr const char* CVAR_STAR_TELESCOPE = CVAR_ENHANCEMENT("MajoraStarTelescope");
+static constexpr const char* CVAR_STAR_SIZE = CVAR_ENHANCEMENT("MajoraStarSize");
+static constexpr const char* CVAR_STAR_INTENSITY = CVAR_ENHANCEMENT("MajoraStarIntensity");
+static constexpr const char* CVAR_STAR_TWINKLE = CVAR_ENHANCEMENT("MajoraStarTwinkle");
+static constexpr const char* CVAR_STAR_TWINKLE_FREQUENCY = CVAR_ENHANCEMENT("MajoraStarTwinkleFrequency");
+static constexpr const char* CVAR_STAR_COUNT = CVAR_ENHANCEMENT("MajoraStarCount");
 
-#define SKYBOX_STAR_SUNRISE_INDEX 0 // sSkyboxTable entries picked by D_8011FC1C
-#define SKYBOX_STAR_SUNSET_INDEX 2
-#define SKYBOX_STAR_NIGHT_INDEX 3
-#define SKYBOX_STAR_BASE_COUNT 100 // Stars drawn before the "Star Count" multiplier is applied
-#define SKYBOX_STAR_COUNT_MULTIPLIER_MIN 1.0f
-#define SKYBOX_STAR_COUNT_MULTIPLIER_MAX 5.0f
-// Free bytes the polyOpa buffer must keep before extra stars stop being added
-#define SKYBOX_STAR_MIN_FREE_BYTES 8192
+static constexpr s32 SKYBOX_STAR_SUNRISE_INDEX = 0; // sSkyboxTable entries picked by D_8011FC1C
+static constexpr s32 SKYBOX_STAR_SUNSET_INDEX = 2;
+static constexpr s32 SKYBOX_STAR_NIGHT_INDEX = 3;
+static constexpr u16 SKYBOX_STAR_BASE_COUNT = 100; // before the "Star Count" multiplier
+static constexpr f32 SKYBOX_STAR_COUNT_MULTIPLIER_MIN = 1.0f;
+static constexpr f32 SKYBOX_STAR_COUNT_MULTIPLIER_MAX = 5.0f;
+static constexpr s32 SKYBOX_STAR_MIN_FREE_BYTES = 8192; // polyOpa headroom kept while adding extra stars
 
-// Telescope star shape: a round core with four diffraction spikes, drawn as geometry whose vertex alpha carries
-// the shape. A static vertex array keeps it safe for display list replay.
-#define SKYBOX_STAR_CORE_SEGMENTS 12
-#define SKYBOX_STAR_CORE_CENTER_ALPHA 235.0f
-#define SKYBOX_STAR_CORE_INNER_RADIUS 0.16f
-#define SKYBOX_STAR_CORE_INNER_ALPHA 105.0f
-#define SKYBOX_STAR_CORE_RADIUS 0.48f
-#define SKYBOX_STAR_ARM_MID_T 0.55f // ring position along the spike
-#define SKYBOX_STAR_ARM_LENGTH_H 0.55f
-#define SKYBOX_STAR_ARM_LENGTH_V 0.47f
-#define SKYBOX_STAR_ARM_WIDTH_BASE 0.060f
-#define SKYBOX_STAR_ARM_WIDTH_MID 0.038f
-#define SKYBOX_STAR_ARM_WIDTH_TIP 0.020f
-#define SKYBOX_STAR_ARM_ALPHA_H 130.0f
-#define SKYBOX_STAR_ARM_ALPHA_V 110.0f
-#define SKYBOX_STAR_ARM_MID_ALPHA 0.45f // ring alpha, relative to the base
-#define SKYBOX_STAR_VTX_SCALE 1000.0f   // Vtx positions are s16, hence pre-multiplied
+// The telescope shape: a round core with four spikes, carried by the vertex alphas of a static array.
+static constexpr s32 SKYBOX_STAR_CORE_SEGMENTS = 12;
+static constexpr f32 SKYBOX_STAR_CORE_CENTER_ALPHA = 235.0f;
+static constexpr f32 SKYBOX_STAR_CORE_INNER_RADIUS = 0.16f;
+static constexpr f32 SKYBOX_STAR_CORE_INNER_ALPHA = 105.0f;
+static constexpr f32 SKYBOX_STAR_CORE_RADIUS = 0.48f;
+static constexpr f32 SKYBOX_STAR_ARM_MID_T = 0.55f; // ring position along the spike
+static constexpr f32 SKYBOX_STAR_ARM_LENGTH_H = 0.55f;
+static constexpr f32 SKYBOX_STAR_ARM_LENGTH_V = 0.47f;
+static constexpr f32 SKYBOX_STAR_ARM_WIDTH_BASE = 0.060f;
+static constexpr f32 SKYBOX_STAR_ARM_WIDTH_MID = 0.038f;
+static constexpr f32 SKYBOX_STAR_ARM_WIDTH_TIP = 0.020f;
+static constexpr f32 SKYBOX_STAR_ARM_ALPHA_H = 130.0f;
+static constexpr f32 SKYBOX_STAR_ARM_ALPHA_V = 110.0f;
+static constexpr f32 SKYBOX_STAR_ARM_MID_ALPHA = 0.45f; // ring alpha, relative to the base
+static constexpr f32 SKYBOX_STAR_VTX_SCALE = 1000.0f;   // Vtx positions are s16, hence pre-multiplied
 
-// Shape the stars added by the count multiplier use, so that a dense sky still fits in the display list budget.
-// It keeps the silhouette of the telescope star with far fewer vertices: a centre and eight rim vertices that
-// alternate between the four spikes and the four inner corners, fanned from the centre.
-#define SKYBOX_STAR_SIMPLE_RIM_COUNT 8
-#define SKYBOX_STAR_SIMPLE_VTX_COUNT (1 + SKYBOX_STAR_SIMPLE_RIM_COUNT)
-#define SKYBOX_STAR_SIMPLE_CENTER_ALPHA 235.0f
-#define SKYBOX_STAR_SIMPLE_CORNER_RADIUS 0.20f
-#define SKYBOX_STAR_SIMPLE_CORNER_ALPHA 150.0f
-#define SKYBOX_STAR_SIMPLE_TIP_RADIUS 0.52f
+// The cheap shape used by the stars the count multiplier adds: a fan to four spike tips and four inner corners.
+static constexpr s32 SKYBOX_STAR_SIMPLE_RIM_COUNT = 8;
+static constexpr s32 SKYBOX_STAR_SIMPLE_VTX_COUNT = 1 + SKYBOX_STAR_SIMPLE_RIM_COUNT;
+static constexpr f32 SKYBOX_STAR_SIMPLE_CENTER_ALPHA = 235.0f;
+static constexpr f32 SKYBOX_STAR_SIMPLE_CORNER_RADIUS = 0.20f;
+static constexpr f32 SKYBOX_STAR_SIMPLE_CORNER_ALPHA = 150.0f;
+static constexpr f32 SKYBOX_STAR_SIMPLE_TIP_RADIUS = 0.52f;
 
-// Intensity setting the shape alphas above are tuned for
-#define SKYBOX_STAR_REFERENCE_INTENSITY 0.5f
-// Twinkle rate in Hz: each star gets its own frequency between MIN_RATIO * slider and the slider value
-#define SKYBOX_STAR_TWINKLE_MAX_FREQUENCY 2.0f
-#define SKYBOX_STAR_TWINKLE_MIN_RATIO 0.15f
-// How far the twinkle dips: 0.5 goes down to half brightness, 1.0 would reach invisible
-#define SKYBOX_STAR_TWINKLE_DEPTH 0.5f
-// osGetTime() counts N64 cycles
-#define SKYBOX_STAR_CYCLES_PER_SECOND 46875000.0f
+static constexpr f32 SKYBOX_STAR_REFERENCE_INTENSITY = 0.5f; // intensity the shape alphas are tuned for
+static constexpr f32 SKYBOX_STAR_TWINKLE_MAX_FREQUENCY = 2.0f;
+static constexpr f32 SKYBOX_STAR_TWINKLE_MIN_RATIO = 0.15f;
+static constexpr f32 SKYBOX_STAR_TWINKLE_DEPTH = 0.5f;            // 0.5 dips to half brightness, 1.0 to invisible
+static constexpr f32 SKYBOX_STAR_CYCLES_PER_SECOND = 46875000.0f; // osGetTime() counts N64 cycles
 
-#define SKYBOX_STAR_CENTER_VTX 0
+static constexpr s32 SKYBOX_STAR_CENTER_VTX = 0;
+static constexpr s32 SKYBOX_STAR_CORE_VTX_COUNT = 1 + (2 * SKYBOX_STAR_CORE_SEGMENTS);
+static constexpr s32 SKYBOX_STAR_VTX_COUNT = SKYBOX_STAR_CORE_VTX_COUNT + (4 * 6); // two G_VTX commands
+
 #define SKYBOX_STAR_CORE_INNER_VTX(i) (1 + (i))
 #define SKYBOX_STAR_CORE_OUTER_VTX(i) ((1 + SKYBOX_STAR_CORE_SEGMENTS) + (i))
 #define SKYBOX_STAR_ARM_VTX(arm, v) ((1 + (2 * SKYBOX_STAR_CORE_SEGMENTS)) + (6 * (arm)) + (v))
-// The core and its two rings
-#define SKYBOX_STAR_CORE_VTX_COUNT ((1 + (2 * SKYBOX_STAR_CORE_SEGMENTS)))
-// Whole star, which needs two G_VTX commands on real hardware
-#define SKYBOX_STAR_VTX_COUNT (SKYBOX_STAR_CORE_VTX_COUNT + (4 * 6))
 
 static u16 sEnvSkyboxNumStars = 0;
-// Night fade of the star field, which also fades the stars in at dusk and out before dawn
+// Dawn and dusk fade of the whole field
 static f32 sSkyboxStarsAlpha = 0.0f;
-// Branch point of the star field in the polyOpa list, NULL when no stars are drawn this frame
+// Branch point of the field in polyOpa, NULL when no stars are drawn this frame
 static Gfx* sSkyboxStarsDList = NULL;
 static Vtx sSkyboxStarVtx[SKYBOX_STAR_VTX_COUNT];
 static bool sSkyboxStarVtxBuilt = false;
-// Alpha scale the vertices were last built with, -1 forces the first build
+// Alpha the vertices were built with, -1 forces the first build
 static f32 sSkyboxStarAlphaScale = -1.0f;
 static Vtx sSkyboxSimpleStarVtx[SKYBOX_STAR_SIMPLE_VTX_COUNT];
 static bool sSkyboxSimpleStarVtxBuilt = false;
 static f32 sSkyboxSimpleStarAlphaScale = -1.0f;
 
-// Places the branch point of the star field, which must happen after the skybox is drawn and before the sun and
-// moon so that the moon still covers the stars.
-extern "C" void MajoraStarField_Setup(PlayState* play) {
+// The branch point must land after the skybox and before the sun and moon, so the moon still covers the stars.
+static void MajoraStarField_Setup(PlayState* play) {
     f32 alpha = 0.0f;
     f32 blend = (f32)play->envCtx.skyboxBlend / 255.0f;
 
@@ -141,9 +131,7 @@ extern "C" void MajoraStarField_Setup(PlayState* play) {
     }
 }
 
-// Vanilla star shape, a small quad. Used when the telescope shape is turned off.
-// The star goes through a recorded matrix, so the frame interpolation smooths it like any other geometry. A
-// screen space texture rectangle would stay pinned to the logical frame while the rest of the scene moves.
+// Vanilla quad shape, drawn through a recorded matrix so the frame interpolation can smooth it.
 static void Ship_DrawSkyboxStarInterpolated(Gfx** gfxP, PlayState* play, Vec3f pos, u32 width, u32 height,
                                             s32 starNum) {
     static Vtx sStarVtxData[] = {
@@ -223,7 +211,7 @@ static void Ship_SetSkyboxStarVtx(Vtx* vtx, f32 x, f32 y, u8 alpha) {
     vtx->v.cn[3] = alpha;
 }
 
-// Builds one spike. The perpendicular is derived from the direction so every arm keeps the same winding.
+// One spike; the perpendicular comes from the direction so every arm keeps the same winding.
 static void Ship_BuildSkyboxStarArm(s32 arm, f32 alongX, f32 alongY, f32 length, f32 alpha, f32 alphaScale) {
     f32 acrossX = -alongY;
     f32 acrossY = alongX;
@@ -327,7 +315,7 @@ static void Ship_SetupSkyboxStarGfx(Gfx** gfxP) {
     *gfxP = gfx;
 }
 
-// Per star hash, kept out of the randInt stream of the star loop so the layout can never change
+// Per star hash, outside the layout's randInt stream so the layout never changes
 static u32 Ship_SkyboxStarHash(u32 seed, s32 starNum) {
     u32 hash = seed ^ ((u32)starNum * 0x9E3779B1);
 
@@ -495,18 +483,15 @@ static void DrawSkyboxStarsImpl(PlayState* play, Gfx** gfxP) {
     s32 i;
     u32 randInt;
     u32 imgWidth;
-    // SoH [Enhancement] Telescope star shape, its size and how opaque it is
     s32 telescopeStars;
     f32 telescopeStarSize;
     f32 telescopeStarAlphaScale;
-    // SoH [Enhancement] Per star twinkling, which rides on the primitive alpha and works in both modes
     s32 twinkleStars;
     f32 twinkleMaxFrequency;
     f32 twinkleTime;
     u32 starSeed;
     Color_RGBA8 starColor;
     bool primColorChanged;
-    // SoH [Enhancement] Star count, scaled up by the "Star Count" setting
     f32 starCountMultiplier;
     s32 starCount;
 
@@ -524,10 +509,7 @@ static void DrawSkyboxStarsImpl(PlayState* play, Gfx** gfxP) {
                                 SKYBOX_STAR_COUNT_MULTIPLIER_MIN, SKYBOX_STAR_COUNT_MULTIPLIER_MAX);
     starCount = (s32)(sEnvSkyboxNumStars * starCountMultiplier);
 
-    // SoH [Port] Play_Draw already keeps billboardMtxF (the billboard rotation) and viewProjectionMtxF
-    // (projection * viewing) up to date for this frame, so unlike the original code the engine matrices are
-    // reused as is instead of being recomputed and overwritten here.
-
+    // Play_Draw keeps billboardMtxF and viewProjectionMtxF up to date, so the engine matrices are reused as is.
     randomColorIndex = 0;
 
     gDPPipeSync(gfx++);
@@ -539,11 +521,10 @@ static void DrawSkyboxStarsImpl(PlayState* play, Gfx** gfxP) {
                         G_TD_CLAMP | G_TP_NONE | G_CYC_1CYCLE | G_PM_NPRIMITIVE,
                     G_AC_NONE | G_ZS_PRIM | G_RM_AA_XLU_LINE | G_RM_AA_XLU_LINE2);
 
-    // SoH [Port] We need to set the render mode to XLU_SURF for alpha logic to be used in Fast3D
-    // If Fast3D changes how it decides alpha in the future, we may be able to remove this line
+    // Fast3D only applies the alpha logic on XLU_SURF
     gDPSetRenderMode(gfx++, G_RM_XLU_SURF, G_RM_XLU_SURF2);
 
-    // SoH [Enhancement] Switch to the telescope star combine mode for the whole loop
+    // The telescope shape carries its silhouette in the vertex alpha, so it needs its own combine mode
     if (telescopeStars) {
         Ship_SetupSkyboxStarGfx(&gfx);
     }
@@ -554,12 +535,11 @@ static void DrawSkyboxStarsImpl(PlayState* play, Gfx** gfxP) {
               ((u32)gSaveContext.playerName[6] << 0) ^ ((u32)gSaveContext.playerName[7] >> 4) ^
               ((u32)gSaveContext.playerName[7] << 0x1C);
 
-    // SoH [Enhancement] Same seed as the layout, captured before the loop mutates randInt
+    // Same seed as the layout, captured before the loop mutates randInt
     starSeed = randInt;
 
     for (i = 0; i < starCount; i++) {
-        // SoH [Enhancement] Extra stars extend the same random stream, so existing ones do not move.
-        // Stop before the display list and the polyOpa allocation arena meet.
+        // Extra stars continue the same random stream, so existing ones do not move. Stop before polyOpa fills up.
         if ((i >= sEnvSkyboxNumStars) &&
             ((s32)((u8*)play->state.gfxCtx->polyOpa.d - (u8*)gfx) < SKYBOX_STAR_MIN_FREE_BYTES)) {
             break;
@@ -581,12 +561,10 @@ static void DrawSkyboxStarsImpl(PlayState* play, Gfx** gfxP) {
 
             randInt = Rand_Next_Variable(&randInt);
 
-            // Set random position
             pos.y = play->view.eye.y + (SQ(temp_f20) * SQ(128.0f)) - 1000.0f;
             pos.x = play->view.eye.x + (Math_SinS((s16)randInt) * (1.2f - temp_f20) * SQ(128.0f));
             pos.z = play->view.eye.z + (Math_CosS((s16)randInt) * (1.2f - temp_f20) * SQ(128.0f));
 
-            // Set random width
             temp_f2 = Rand_ZeroOne_Variable(&randInt);
             imgWidth = (u32)((SQ(temp_f2) * 8.0f) + 2.0f);
         }
@@ -602,25 +580,21 @@ static void DrawSkyboxStarsImpl(PlayState* play, Gfx** gfxP) {
             primColorChanged = false;
         }
 
-        // SoH [Enhancement] The twinkle needs a per star primitive alpha, so resend the color every star
+        // The per star twinkle needs its own primitive alpha, so the color is resent every star
         if (primColorChanged || twinkleStars) {
-            // SoH [Enhancement] The telescope combine mode drops the environment color, so fold the
-            // dawn and dusk fade in here
+            // The telescope combine mode drops the environment color, so the dawn and dusk fade is folded in here
             f32 primAlpha = telescopeStars ? (starColor.a * sSkyboxStarsAlpha) : starColor.a;
 
             if (twinkleStars) {
-                // Dip to half of the intensity setting, and back
                 primAlpha *= Ship_SkyboxStarTwinkle(starSeed, i, twinkleTime, twinkleMaxFrequency);
             }
 
             gDPSetPrimColor(gfx++, 0, 0, starColor.r, starColor.g, starColor.b, (u8)CLAMP(primAlpha, 0.0f, 255.0f));
         }
 
-        // SoH [Enhancement] Both star shapes go through a recorded matrix, so that the frame interpolation can
-        // smooth them. A screen space texture rectangle would stay pinned to the logical frame.
+        // Both shapes go through a recorded matrix so the frame interpolation can smooth them
         if (telescopeStars) {
-            // The stars the count multiplier adds use the cheap shape, so that a dense sky still fits in the
-            // display list budget. The ones the scene asks for keep the detailed telescope shape.
+            // The stars the multiplier adds use the cheap shape, which keeps the display list small
             Ship_DrawSkyboxStarTelescope(&gfx, play, pos, imgWidth, i, telescopeStarSize, telescopeStarAlphaScale,
                                          i >= sEnvSkyboxNumStars);
         } else {
@@ -632,9 +606,8 @@ static void DrawSkyboxStarsImpl(PlayState* play, Gfx** gfxP) {
     *gfxP = gfx;
 }
 
-// Fills the star field into the branch point placed by MajoraStarField_Setup, now that the view matrix
-// of this frame is final.
-extern "C" void MajoraStarField_Draw(PlayState* play) {
+// Fills the branch point placed by MajoraStarField_Setup, now that the view matrix of the frame is final.
+static void MajoraStarField_Draw(PlayState* play) {
     Gfx* nextOpa;
     Gfx* opa;
 
@@ -658,3 +631,12 @@ extern "C" void MajoraStarField_Draw(PlayState* play) {
         CLOSE_DISPS(play->state.gfxCtx);
     }
 }
+
+static void RegisterMajoraStarField() {
+    COND_HOOK(OnPlayDrawSkyboxEnd, CVarGetInteger(CVAR_STAR_FIELD, 0), []() { MajoraStarField_Setup(gPlayState); });
+    COND_HOOK(OnPlayDrawViewFinal, CVarGetInteger(CVAR_STAR_FIELD, 0), []() { MajoraStarField_Draw(gPlayState); });
+
+    sSkyboxStarsDList = NULL;
+}
+
+static RegisterShipInitFunc initFunc(RegisterMajoraStarField, { CVAR_STAR_FIELD });
